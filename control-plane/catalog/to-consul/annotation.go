@@ -32,4 +32,9 @@ const (
 	// e.g. Service `backend` in k8s cluster `A` receives 25% of the traffic
 	// compared to same `backend` service in k8s cluster `B`.
 	annotationServiceWeight = "consul.hashicorp.com/service-weight"
+
+	// annotationServiceCheckPrefix is the prefix for setting the healthcheck
+	// configuration for a service. The remainder of the key is the port to use and the value
+	// is a name=path pair to register the check as.
+	annotationServiceCheckPrefix = "consul.hashicorp.com/service-http-healthcheck-"
 )

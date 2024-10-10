@@ -5,6 +5,9 @@ package catalog
 
 import (
 	"context"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	mapset "github.com/deckarep/golang-set"
@@ -1218,6 +1221,67 @@ func TestServiceResource_clusterIP_healthCheck(t *testing.T) {
 	})
 }
 
+// Test that the proper registrations with health checks are generated for a ClusterIP type.
+func TestServiceResource_clusterIP_healthCheck_http(t *testing.T) {
+	t.Parallel()
+	client := fake.NewSimpleClientset()
+	syncer := newTestSyncer()
+	serviceResource := defaultServiceResource(client, syncer)
+	serviceResource.ClusterIPSync = true
+
+	// Start the controller
+	closer := controller.TestControllerRun(&serviceResource)
+	defer closer()
+
+	serverPort := "8080"
+	listener, err := net.Listen("tcp", "127.0.0.1:"+serverPort)
+	if err != nil {
+		require.NoError(t, err)
+	}
+	defer listener.Close()
+
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("hello-world"))
+		} else {
+			w.WriteHeader(http.StatusNotFound)
+			w.Write([]byte("not found"))
+		}
+	}))
+
+	// Use the custom listener instead of the default one
+	server.Listener = listener
+	server.Start()
+	defer server.Close()
+
+	// Insert the service
+	svc := clusterIPService("foo", metav1.NamespaceDefault)
+	svc.Annotations[annotationServiceCheckPrefix+"test-name"] = "/healthz"
+	svc.Annotations[annotationServicePort] = serverPort
+
+	_, err = client.CoreV1().Services(metav1.NamespaceDefault).Create(context.Background(), svc, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	createNodes(t, client)
+
+	// Insert the endpoint slice
+	createEndpointSliceLocalHost(t, client, "foo", metav1.NamespaceDefault)
+
+	// Verify what we got
+	retry.Run(t, func(r *retry.R) {
+		syncer.Lock()
+		defer syncer.Unlock()
+		actual := syncer.Registrations
+		require.Len(r, actual, 1)
+		require.Len(r, actual[0].Checks, 1)
+		require.Equal(r, "test-name", actual[0].Checks[0].Name)
+		require.Equal(r, "hello-world", actual[0].Checks[0].Output)
+		require.Equal(r, "http", actual[0].Checks[0].Type)
+		require.Equal(r, consulapi.HealthPassing, actual[0].Checks[0].Status)
+	})
+}
+
 // Test clusterIP with prefix.
 func TestServiceResource_clusterIPPrefix(t *testing.T) {
 	t.Parallel()
@@ -2168,6 +2232,39 @@ func createEndpointSlice(t *testing.T, client *fake.Clientset, serviceName strin
 				{
 					Name: ptr.To("rpc"),
 					Port: ptr.To(int32(2000)),
+				},
+			},
+		},
+		metav1.CreateOptions{})
+	require.NoError(t, err)
+}
+
+func createEndpointSliceLocalHost(t *testing.T, client *fake.Clientset, serviceName string, namespace string) {
+	_, err := client.DiscoveryV1().EndpointSlices(namespace).Create(
+		context.Background(),
+		&discoveryv1.EndpointSlice{
+			ObjectMeta: metav1.ObjectMeta{
+				Labels: map[string]string{discoveryv1.LabelServiceName: serviceName},
+				Name:   serviceName + "-" + rand.String(5),
+			},
+			AddressType: discoveryv1.AddressTypeIPv4,
+			Endpoints: []discoveryv1.Endpoint{
+				{
+					Addresses: []string{"127.0.0.1"},
+					Conditions: discoveryv1.EndpointConditions{
+						Ready:       ptr.To(true),
+						Serving:     ptr.To(true),
+						Terminating: ptr.To(false),
+					},
+					TargetRef: &corev1.ObjectReference{Kind: "pod", Name: "foobar"},
+					NodeName:  ptr.To(nodeName1),
+					Zone:      ptr.To("us-west-2a"),
+				},
+			},
+			Ports: []discoveryv1.EndpointPort{
+				{
+					Name: ptr.To("http"),
+					Port: ptr.To(int32(8080)),
 				},
 			},
 		},

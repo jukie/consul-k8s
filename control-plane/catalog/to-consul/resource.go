@@ -6,9 +6,13 @@ package catalog
 import (
 	"context"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	mapset "github.com/deckarep/golang-set"
 	"github.com/hashicorp/consul-k8s/control-plane/catalog/metrics"
@@ -805,6 +809,28 @@ func (t *ServiceResource) registerServiceInstance(
 					Output:    kubernetesSuccessReasonMsg,
 				}
 
+				for k, v := range t.serviceMap[key].Annotations {
+					if !strings.HasPrefix(k, annotationServiceCheckPrefix) {
+						continue
+					}
+					httpCheckName := strings.TrimPrefix(k, annotationServiceCheckPrefix)
+					// Split after first equal
+					check := &consulapi.HealthCheck{
+						CheckID:   consulHealthCheckID(endpointSlice.Namespace, serviceID(r.Service.Service, addr)),
+						Name:      httpCheckName,
+						Namespace: baseService.Namespace,
+						Type:      "http",
+						ServiceID: serviceID(r.Service.Service, addr),
+					}
+
+					var err error
+					check.Status, check.Output, err = httpGetter(t.Ctx, v, addr, epPort)
+					if err != nil {
+						t.Log.Error("issue performing http healthcheck", "error", err)
+						continue
+					}
+					r.Checks = append(r.Checks, check)
+				}
 				t.consulMap[key] = append(t.consulMap[key], &r)
 			}
 		}
@@ -1103,4 +1129,40 @@ func getServiceWeight(weight string) (int, error) {
 	}
 
 	return weightI, nil
+}
+
+var httpClient = &http.Client{
+	Timeout: 5 * time.Second,
+}
+
+func httpGetter(ctx context.Context, path string, addr string, port int) (string, string, error) {
+	u := url.URL{
+		Scheme: "http",
+		Host:   addr + ":" + strconv.Itoa(port),
+		Path:   path,
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to build HTTP GET request for %s: %w", u.String(), err)
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to perform HTTP GET to %s: %w", u.String(), err)
+	}
+	defer resp.Body.Close()
+
+	// Limit the response body to default limit of 4KB (https://developer.hashicorp.com/consul/api-docs/agent/check#outputmaxsize)
+	// TODO: make configurable
+	limitedReader := io.LimitReader(resp.Body, 4096)
+	responseBytes, err := io.ReadAll(limitedReader)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to read response body from %s: %w", u.String(), err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return consulapi.HealthCritical, string(responseBytes), nil
+	}
+	return consulapi.HealthPassing, string(responseBytes), nil
 }
